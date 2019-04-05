@@ -1,304 +1,172 @@
-function [trackResults, channel]= tracking(fid, channel, settings,data)
-% Performs code and carrier tracking for all channels.
-%对所有卫星信号实行 码跟踪和载波跟踪
-%[trackResults, channel] = tracking(fid, channel, settings)
-%
-%   Inputs:
-%       fid             - file identifier of the signal record. 信号记录的文件标识符
-%       channel         - PRN, carrier frequencies and code phases of all
-%                       satellites to be tracked (prepared by preRun.m from
-%                       acquisition results).
-%                       将要跟踪的所有卫星的载波频率和码相位（由preRun.m根据捕获结果提供）
-%       settings        - receiver settings. 接收机的设置
-%   Outputs:
-%       trackResults    - tracking results (structure array). Contains
-%                       in-phase prompt outputs and absolute spreading
-%                       code's starting positions, together with other
-%                       observation data from the tracking loops. All are
-%                       saved every millisecond.
-%       跟踪结果 - 跟踪结果（结构体数组）
-%                             包括： in-phase prompt outputs
-%                                         绝对扩展码的起始位置
-%                                         从跟踪环得到的观察数据
+function trackResult = tracking(fid, acqResult, settings,data)
+%% test
+loopPara = loopCanshuCalculate(settings);%计算环路滤波器参数
 
-%--------------------------------------------------------------------------
-%                           SoftGNSS v3.0
-% 
-% Copyright (C) Dennis M. Akos
-% Written by Darius Plausinaitis and Dennis M. Akos
-% Based on code by DMAkos Oct-1999
-%--------------------------------------------------------------------------
-%This program is free software; you can redistribute it and/or
-%modify it under the terms of the GNU General Public License
-%as published by the Free Software Foundation; either version 2
-%of the License, or (at your option) any later version.
-%
-%This program is distributed in the hope that it will be useful,
-%but WITHOUT ANY WARRANTY; without even the implied warranty of
-%MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-%GNU General Public License for more details.
-%
-%You should have received a copy of the GNU General Public License
-%along with this program; if not, write to the Free Software
-%Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-%USA.
-%--------------------------------------------------------------------------
+codeTable = cacode(settings.PRN);          %调用函数，产生伪随机码
 
-%CVS record:
-%$Id: tracking.m,v 1.14.2.31 2006/08/14 11:38:22 dpl Exp $
+fllNcoAdder = 0;                   %fll  NCO加法器，应该在滤波器中使用
+carrierNcoSum = 0;                 %给这个值再乘2*pi就是相位了
+pllNcoAdder = 0;                   %pll  NCO加法器，应该在滤波器中使用
+loopCount = 0;                      %循环次数
+codeNcoSum = 0;                    %大概是一个和相位很像的东西
+codeNcoAdder = 0;                  %ddll  NCO加法器，应该在滤波器中使用
+nIQ = 2;                            
+n = 3;
+outputFll(2:3) = 0;                 %这里面大概是fll鉴频器的输出
+outputFilterFll(1:3) = 0;          %fll 环路滤波器的输出
+outputFilterPll(1:3) = 0;          %pll 环路滤波器的输出
+outputPll(2:3) = 0;                 %pll 鉴频器的输出
+outputFilterDdll(1:3) = 0;         %ddll 环路滤波器的输出
+trackResult.pllDiscrFilter = zeros(1,settings.msToProcess);
 
-%% Initialize result structure ============================================
-%   初始化结果结构体
-% Channel status    通道状态
-trackResults.status         = '-';      % No tracked signal, or lost lock   无跟踪信号或失锁
 
-% The absolute sample in the record of the C/A code start:  C/A码起始记录的绝对采样
-trackResults.absoluteSample = zeros(1, settings.msToProcess);
 
-% Freq of the C/A code: C/A码的频率
-trackResults.codeFreq       = inf(1, settings.msToProcess);
+Tcoh = settings.Tcoh;          %积分清零时间
+global earlyCodeNco;      %是接收端的，因为早码的话，即时码和晚码都可以从其中而来
+earlyCodeNco = ((1 - (acqResult.codePhase-3)/settings.samplesPerCode)...
+    *settings.codeLength) * 2^settings.ncoLength;
+earlyCodeNco = mod(earlyCodeNco,2^settings.ncoLength*1023);
+localEarlyCodeLast = localEarlycodeInitial(settings,codeTable); %产生本地超前码，接收端使用，因为早码的话，即时码和晚码都可以从其中而来
 
-% Frequency of the tracked carrier wave: 跟踪的载波频率
-trackResults.carrFreq       = inf(1, settings.msToProcess);
-
-% Outputs from the correlators (In-phase):  I相
-trackResults.I_P            = zeros(1, settings.msToProcess);
-trackResults.I_E            = zeros(1, settings.msToProcess);
-trackResults.I_L            = zeros(1, settings.msToProcess);
-
-% Outputs from the correlators (Quadrature-phase): Q相
-trackResults.Q_E            = zeros(1, settings.msToProcess);
-trackResults.Q_P            = zeros(1, settings.msToProcess);
-trackResults.Q_L            = zeros(1, settings.msToProcess);
-
-% Loop discriminators 环路鉴相
-trackResults.dllDiscr       = inf(1, settings.msToProcess);
-trackResults.dllDiscrFilt   = inf(1, settings.msToProcess);
-trackResults.pllDiscr       = inf(1, settings.msToProcess);
-trackResults.pllDiscrFilt   = inf(1, settings.msToProcess);
-
-%--- Copy initial settings for all channels -------------------------------
-trackResults = repmat(trackResults, 1, settings.numberOfChannels);
-
-%% Initialize tracking variables ==========================================
-
-codePeriods = settings.msToProcess;     % For GPS one C/A code is one ms
-
-%--- DLL variables --------------------------------------------------------
-% Define early-late offset (in chips)
-earlyLateSpc = settings.dllCorrelatorSpacing;   %dll相关间距
-
-% Summation interval 总的时间间隔
-PDIcode = 0.001;
-
-% Calculate filter coefficient values   计算滤波器系数值
-[tau1code, tau2code] = calcLoopCoef(settings.dllNoiseBandwidth, ...
-                                    settings.dllDampingRatio, ...
-                                    1.0);
-
-%--- PLL variables --------------------------------------------------------
-% Summation interval
-PDIcarr = 0.001;
-
-% Calculate filter coefficient values
-[tau1carr, tau2carr] = calcLoopCoef(settings.pllNoiseBandwidth, ...
-                                    settings.pllDampingRatio, ...
-                                    0.25);
-hwb = waitbar(0,'Tracking...');
-
-%% Start processing channels ==============================================
-for channelNr = 1:settings.numberOfChannels
+trackResult.carrNcoPhases = zeros(1,settings.msToProcess);       %每次积分清零前载波的nco相位,未经过转换
+trackResult.codeNcoPhases = zeros(1,settings.msToProcess);       %每次积分清零前B1码的nco相位,未经过转换
+trackResult.carrFreq = zeros(1,settings.msToProcess);
+trackResult.trackFlag = 0;                  %捕获成功标志位
+blksize = settings.samplesPerCode;
+startCountPhase = -100;
+carrStartPhaseSum = 0;
+codeStartPhaseSum = 0;
+for loopNum = 1 : settings.msToProcess
     
-    % Only process if PRN is non zero (acquisition was successful)
-    if (channel(channelNr).PRN ~= 0)
-        % Save additional information - each channel's tracked PRN
-        trackResults(channelNr).PRN     = channel(channelNr).PRN;
+    
+    
+    
+    carrNcoPhase = mod(carrierNcoSum,2^settings.ncoLength) * 2 * pi;  
+    if carrNcoPhase > pi*2^settings.ncoLength
+        trackResult.carrNcoPhases(loopNum) = ...
+             ((carrNcoPhase - 2*pi*2^settings.ncoLength)/2*pi);
+    else
+        trackResult.carrNcoPhases(loopNum) = (carrNcoPhase/2*pi);
+    end
+    trackResult.codeNcoPhases(loopNum) = ...
+        ((((earlyCodeNco)/settings.codeLength)*settings.samplesPerCode...
+         -2.5*2^settings.ncoLength) /settings.samplesPerCode)*settings.codeLength;       
+    trackResult.carrFreq(loopNum) = ...
+         (settings.middleFreqNco1 + fllNcoAdder + pllNcoAdder)/settings.transferCoef;
+    trackResult.flag(loopNum) = settings.PLLFlag;         %标识该次循环有没有进行PLL锁定
+    %读取接收数据
+    receiveSignal = data(fid:fid + blksize - 1);
+    fid = fid + blksize ;
+
+    if 1 == settings.PLLFlag
+        startCountPhase = startCountPhase + 1;
+        if startCountPhase >= 1
+            carrStartPhaseSum = carrStartPhaseSum + trackResult.carrNcoPhases(loopNum);
+            codeStartPhaseSum = codeStartPhaseSum + trackResult.codeNcoPhases(loopNum);
+        end
+    else     
+        if startCountPhase >= -10
+            startCountPhase = -15;
+            carrStartPhaseSum = 0;
+            codeStartPhaseSum = 0;
+        end
+    end
+    
+    %产生本地再生载波
+    for demondNum = 1:settings.Ncoh 
+        localCos(demondNum) = cos(2*pi*carrierNcoSum/2^settings.ncoLength);
+        localSin(demondNum) = -sin(2*pi*carrierNcoSum/2^settings.ncoLength);
+        carrierNcoSum = carrierNcoSum + settings.middleFreqNco1 + fllNcoAdder + pllNcoAdder ;%本地再生载波NCO
+    end
+    
+    codeNcoSum = codeNcoAdder + settings.codeWord ...              %本地再生码环NCO,和上面的carrierNcoSum作用一样,2048为基准
+        + fllNcoAdder*settings.cofeFLLAuxiDDLL;                
+  
+     %产生本地超前，即时，滞后码
+    [localEarlyCode,localPromptCode,localLateCode,settings.localPhase]=localcodeGenerate(localEarlyCodeLast,codeNcoSum,codeTable,settings);
+    localEarlyCodeLast = localEarlyCode;
+    %载波解调    
+    IDemonCarrier = localCos.*receiveSignal;
+    QDemonCarrier = localSin.*receiveSignal;
+
+    
+    %信号解扩并积分清除
+    I_E_final = sum(IDemonCarrier.*localEarlyCode);
+    Q_E_final = sum(QDemonCarrier.*localEarlyCode);
+    I_P_final(nIQ) = sum(IDemonCarrier.*localPromptCode);
+    Q_P_final(nIQ) = sum(QDemonCarrier.*localPromptCode);
+    I_L_final = sum(IDemonCarrier.*localLateCode);
+    Q_L_final = sum(QDemonCarrier.*localLateCode);
+    
+    
+%     I_P_final(nIQ) = sum(IDemonCarrier);
+%     Q_P_final(nIQ) = sum(QDemonCarrier);
+    
+    
+    if  1 == loopNum
+        I_P_final(nIQ - 1) = I_P_final(nIQ);
+        Q_P_final(nIQ - 1) = Q_P_final(nIQ);
+    else
+% %         四象限反正切鉴频器
+        dotFll = I_P_final(nIQ - 1) * I_P_final(nIQ) + Q_P_final(nIQ - 1) * Q_P_final(nIQ);
+        crossFll = I_P_final(nIQ - 1) * Q_P_final(nIQ) - I_P_final(nIQ) * Q_P_final(nIQ - 1);
+        outputFll(n) = atan2(crossFll,dotFll)/(Tcoh*2*pi); 
+        trackResult.FllDiscr(loopNum) = outputFll(n);
         
-        % Move the starting point of processing. Can be used to start the
-        % signal processing at any point in the data record (e.g. for long
-        % records). In addition skip through that data file to start at the
-        % appropriate sample (corresponding to code phase). Assumes sample
-        % type is schar (or 1 byte per sample) 
-        %fseek(fid, ...
-        %      settings.skipNumberOfBytes + channel(channelNr).codePhase-1, ...
-        %      'bof');
-        fid = fid + channel(channelNr).codePhase-1;
-
-        % Get a vector with the C/A code sampled 1x/chip
-        caCode = cacode(18);
-        % Then make it possible to do early and late versions
-        caCode = [caCode(1023) caCode caCode(1)];
-
-        %--- Perform various initializations ------------------------------
-
-        % define initial code frequency basis of NCO
-        codeFreq      = settings.codeFreqBasis;
-        % define residual code phase (in chips) 定义剩余代码阶段
-        remCodePhase  = 0.0;
-        % define carrier frequency which is used over whole tracking period
-        carrFreq      = channel(channelNr).acquiredFreq;
-        carrFreqBasis = channel(channelNr).acquiredFreq;
-        % define residual carrier phase 定义剩余载波相位
-        remCarrPhase  = 0.0;
-
-        %code tracking loop parameters
-        oldCodeNco   = 0.0;
-        oldCodeError = 0.0;
-
-        %carrier/Costas loop parameters
-        oldCarrNco   = 0.0;
-        oldCarrError = 0.0;
-
-        %=== Process the number of specified code periods =================
-        for loopCnt =  1:codePeriods
+        outputFilterFll(n) = (loopPara.cofeone_FLL * outputFll(n)) + (loopPara.cofetwo_FLL * outputFll(n - 1)) + (2 * outputFilterFll(n - 1)) - outputFilterFll(n - 2);
+        trackResult.fllDiscrFilt(loopNum) = outputFilterFll(n);
+        
+        fllNcoAdder = outputFilterFll(n) * settings.transferCoef ;  %频率字转换      
+        outputFll(n - 1)=outputFll(n);
+        outputFilterFll(n - 2)=outputFilterFll(n - 1);
+        outputFilterFll(n - 1)=outputFilterFll(n);
+        
+         if settings.PLLFlag == 1
+            %锁相环鉴相器
+            outputPll(n) = atan2(Q_P_final(nIQ),I_P_final(nIQ)); 
+            outputFilterPll(n) = loopPara.cofeone_PLL*outputPll(n) + loopPara.cofetwo_PLL*outputPll(n-1)+loopPara.cofethree_PLL*outputPll(n-2)+2*outputFilterPll(n-1)-outputFilterPll(n-2);
+            trackResult.pllDiscr(loopNum) = outputPll(n);
+            trackResult.pllDiscrFilter(loopNum) = outputFilterPll(n);
+            pllNcoAdder = (outputFilterPll(n)/(2*pi)) * settings.transferCoef;  %频率字转换
             
-%% GUI update -------------------------------------------------------------
-            % The GUI is updated every 50ms. This way Matlab GUI is still
-            % responsive enough. At the same time Matlab is not occupied
-            % all the time with GUI task.
-            if (rem(loopCnt, 50) == 0)
-                try
-                    waitbar(loopCnt/codePeriods, ...
-                            hwb, ...
-                            ['Tracking: Ch ', int2str(channelNr), ...
-                            ' of ', int2str(settings.numberOfChannels), ...
-                            '; PRN#', int2str(channel(channelNr).PRN), ...
-                            '; Completed ',int2str(loopCnt), ...
-                            ' of ', int2str(codePeriods), ' msec']);                       
-                catch
-                    % The progress bar was closed. It is used as a signal
-                    % to stop, "cancel" processing. Exit.
-                    disp('Progress bar closed, exiting...');
-                    return
-                end
+%             outputPll(1:2) = outputPll(2:3);
+%             outputFilterPll(1:2) = outputFilterPll(2:3);
+            outputPll(n-2) = outputPll(n-1);
+            outputPll(n-1) = outputPll(n);
+            outputFilterPll(n-2) = outputFilterPll(n-1);
+            outputFilterPll(n-1) = outputFilterPll(n);
+         end
+        
+        I_P_final(nIQ - 1) = I_P_final(nIQ);
+        Q_P_final(nIQ - 1) = Q_P_final(nIQ);
+       if 0 == settings.PLLFlag  && abs(outputFll(n))<10  %锁频环工作状态下，信号与本地频差小于10时
+            loopCount = loopCount + 1;
+            if  loopCount>200            
+                   settings.PLLFlag = 1;
             end
+       elseif  1 == settings.PLLFlag && abs(outputFll(n))>30      %在锁相环工作状态下，锁频环所鉴出的信号与本地频差大于30时
+            loopCount = loopCount-1;
+            if  0 == loopCount
+                settings.PLLFlag = 0;
+            end
+       end
+    end
+ %码环鉴别器
+    outputDdll(n) = ((I_E_final - I_L_final)*I_P_final(nIQ) + (Q_E_final - Q_L_final)*Q_P_final(nIQ) )/((I_P_final(nIQ)^2 + Q_P_final(nIQ)^2)*2);  % DDLL_discri_1      
+    trackResult.dllDiscr(loopNum) = outputDdll(n);
+    %码环滤波器（二阶）
+    outputFilterDdll(n) = outputFilterDdll(n -1) + (loopPara.cofeone_DDLL*outputDdll(n)) + loopPara.cofetwo_DDLL*outputDdll(n - 1);
+    trackResult.dllDiscrFilter(loopNum) = outputFilterDdll(n);
+    % 转换成频率控制字
+    codeNcoAdder = outputFilterDdll(n) * settings.transferCoef ; %频率字转换
+    outputDdll(n - 1)=outputDdll(n);
+    outputFilterDdll(n - 1) = outputFilterDdll(n);
+    
+    
+end
 
-%% Read next block of data ------------------------------------------------            
-            % Find the size of a "block" or code period in whole samples
-            % Update the phasestep based on code freq (variable) and
-            % sampling frequency (fixed)
-            %在整个样本中查找“块”或代码周期的大小，根据代码频率（可变）和采样频率（固定）更新相位测试。
-            codePhaseStep = codeFreq / settings.samplingFreq;
-            
-            blksize = ceil((settings.codeLength-remCodePhase) / codePhaseStep);
-            
-            % Read in the appropriate number of samples to process this
-            % interation 
-            rawSignal = data(fid:fid + blksize - 1);
-            fid = fid + blksize ;
-            %rawSignal = rawSignal';  %transpose vector
-            
-            % If did not read in enough samples, then could be out of 
-            % data - better exit 
-           
-
-          
-
-%% Set up all the code phase tracking information -------------------------
-            % Define index into early code vector
-            %将索引定义为早期代码向量
-            tcode       = (remCodePhase-earlyLateSpc) : ...
-                          codePhaseStep : ...
-                          ((blksize-1)*codePhaseStep+remCodePhase-earlyLateSpc);
-            tcode2      = ceil(tcode) + 1;
-            earlyCode   = caCode(tcode2);
-            
-            % Define index into late code vector
-            tcode       = (remCodePhase+earlyLateSpc) : ...
-                          codePhaseStep : ...
-                          ((blksize-1)*codePhaseStep+remCodePhase+earlyLateSpc);
-            tcode2      = ceil(tcode) + 1;
-            lateCode    = caCode(tcode2);
-            
-            % Define index into prompt code vector
-            tcode       = remCodePhase : ...
-                          codePhaseStep : ...
-                          ((blksize-1)*codePhaseStep+remCodePhase);
-            tcode2      = ceil(tcode) + 1;
-            promptCode  = caCode(tcode2);
-            
-            remCodePhase = (tcode(blksize) + codePhaseStep) - 1023.0;
-
-%% Generate the carrier frequency to mix the signal to baseband -----------
-            time    = (0:blksize) ./ settings.samplingFreq;
-            
-            % Get the argument to sin/cos functions
-            trigarg = ((carrFreq * 2.0 * pi) .* time) + remCarrPhase;
-            remCarrPhase = rem(trigarg(blksize+1), (2 * pi));
-            
-            % Finally compute the signal to mix the collected data to bandband
-            % 最后计算信号，将采集到的数据与频带混合。
-            carrCos = cos(trigarg(1:blksize));
-            carrSin = sin(trigarg(1:blksize));
-
-%% Generate the six standard accumulated values ---------------------------
-            % First mix to baseband
-            qBasebandSignal = carrCos .* rawSignal;
-            iBasebandSignal = carrSin .* rawSignal;
-
-            % Now get early, late, and prompt values for each
-            I_E = sum(earlyCode  .* iBasebandSignal);
-            Q_E = sum(earlyCode  .* qBasebandSignal);
-            I_P = sum(promptCode .* iBasebandSignal);
-            Q_P = sum(promptCode .* qBasebandSignal);
-            I_L = sum(lateCode   .* iBasebandSignal);
-            Q_L = sum(lateCode   .* qBasebandSignal);
-            
-%% Find PLL error and update carrier NCO ----------------------------------
-
-            % Implement carrier loop discriminator (phase detector) 实现载波环路鉴别器
-            carrError = atan(Q_P / I_P) / (2.0 * pi);
-            
-            % Implement carrier loop filter and generate NCO command 执行载波环路滤波器并生成NCO命令
-            carrNco = oldCarrNco + (tau2carr/tau1carr) * ...
-                (carrError - oldCarrError) + carrError * (PDIcarr/tau1carr);
-            oldCarrNco   = carrNco;
-            oldCarrError = carrError;
-
-            % Modify carrier freq based on NCO command 基于NCO命令修改载波频率
-            carrFreq = carrFreqBasis + carrNco;
-
-            trackResults(channelNr).carrFreq(loopCnt) = carrFreq;
-
-%% Find DLL error and update code NCO -------------------------------------
-            codeError = (sqrt(I_E * I_E + Q_E * Q_E) - sqrt(I_L * I_L + Q_L * Q_L)) / ...
-                (sqrt(I_E * I_E + Q_E * Q_E) + sqrt(I_L * I_L + Q_L * Q_L));
-            
-            % Implement code loop filter and generate NCO command
-            codeNco = oldCodeNco + (tau2code/tau1code) * ...
-                (codeError - oldCodeError) + codeError * (PDIcode/tau1code);
-            oldCodeNco   = codeNco;
-            oldCodeError = codeError;
-            
-            % Modify code freq based on NCO command
-            codeFreq = settings.codeFreqBasis - codeNco;
-            
-            trackResults(channelNr).codeFreq(loopCnt) = codeFreq;
-
-%% Record various measures to show in postprocessing ----------------------
-            % Record sample number (based on 8bit samples)记录样品编号（基于8位样品）
-            trackResults(channelNr).absoluteSample(loopCnt) = fid;
-
-            trackResults(channelNr).dllDiscr(loopCnt)       = codeError;
-            trackResults(channelNr).dllDiscrFilt(loopCnt)   = codeNco;
-            trackResults(channelNr).pllDiscr(loopCnt)       = carrError;
-            trackResults(channelNr).pllDiscrFilt(loopCnt)   = carrNco;
-
-            trackResults(channelNr).I_E(loopCnt) = I_E;
-            trackResults(channelNr).I_P(loopCnt) = I_P;
-            trackResults(channelNr).I_L(loopCnt) = I_L;
-            trackResults(channelNr).Q_E(loopCnt) = Q_E;
-            trackResults(channelNr).Q_P(loopCnt) = Q_P;
-            trackResults(channelNr).Q_L(loopCnt) = Q_L;
-        end % for loopCnt
-
-        % If we got so far, this means that the tracking was successful
-        % Now we only copy status, but it can be update by a lock detector
-        % if implemented
-        trackResults(channelNr).status  = channel(channelNr).status;        
-        
-    end % if a PRN is assigned
-end % for channelNr 
-
-% Close the waitbar
-close(hwb)
+trackResult.carrPhase = carrStartPhaseSum / startCountPhase;
+trackResult.codePhase = codeStartPhaseSum / startCountPhase;
+if  startCountPhase > 0
+    trackResult.trackFlag = 1;
+end
